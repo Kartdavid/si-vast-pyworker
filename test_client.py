@@ -40,8 +40,21 @@ def _post_json(url: str, body: dict, headers: dict | None = None, timeout: int =
         return json.loads(r.read())
 
 
+def _endpoint_key(account_key: str) -> str:
+    """The /route/ service authenticates with the ENDPOINT's own key (rotating), not the
+    account key — fetch it from the endpoint list."""
+    req = urllib.request.Request("https://console.vast.ai/api/v0/endptjobs/",
+                                 headers={"Authorization": f"Bearer {account_key}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read())
+    for ep in data.get("results", []):
+        if ep.get("endpoint_name") == ENDPOINT_NAME:
+            return ep["api_key"]
+    sys.exit(f"endpoint '{ENDPOINT_NAME}' not found in this account/team")
+
+
 def call(route: str, payload: dict) -> dict:
-    key = _api_key()
+    key = _endpoint_key(_api_key())
     t0 = time.perf_counter()
     auth = _post_json(ROUTE_URL, {"endpoint": ENDPOINT_NAME, "cost": 100},
                       {"Authorization": f"Bearer {key}"})

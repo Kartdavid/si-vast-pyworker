@@ -97,6 +97,11 @@ def _load_models():
 
             _loaded = True
             print("MODELS_LOADED", flush=True)
+            # Signal readiness ONLY now: the PyWorker's benchmark starts on this marker,
+            # and it must run against loaded models (its requests time out if they have to
+            # sit through the multi-GB model download; Vast allows ~38 min to reach this
+            # line, so late is safe — early is what kills workers).
+            print("MODEL_SERVER_READY", flush=True)
         except Exception as e:  # load failures are fatal for this worker — flag loudly
             _load_error = str(e)
             traceback.print_exc()
@@ -108,9 +113,9 @@ api = FastAPI(title="Sticker it — GPU masking (Vast)", version="1.1.0")
 
 @api.on_event("startup")
 def _on_startup():
-    # Port is (about to be) open — tell the PyWorker we're ready to accept connections,
-    # then warm the models in the background.
-    print("MODEL_SERVER_READY", flush=True)
+    # Port opens right away (so nothing ever gets "connection refused"); the models warm
+    # in the background and MODEL_SERVER_READY is printed only when they're loaded.
+    print("MODEL_SERVER_STARTING", flush=True)
     threading.Thread(target=_load_models, daemon=True).start()
 
 
