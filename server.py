@@ -3,30 +3,34 @@
 Runs as a plain FastAPI app on 127.0.0.1:18000 behind the Vast PyWorker (worker.py),
 which proxies JSON requests from the Vast serverless router to this server.
 
+Startup design (matters on Vast): the HTTP port opens IMMEDIATELY and prints
+MODEL_SERVER_READY; the models (~4 GB download on a fresh machine) load in a background
+thread. Requests arriving before the models finish simply wait on the load lock. This is
+required because Vast's benchmark probes the server shortly after startup — if the port
+only opened after model load (the old design), slow hosts failed the benchmark with
+"Cannot connect" and the worker got destroyed in a loop.
+
 Endpoints (all JSON in / JSON out — the PyWorker forwards JSON payloads):
-  GET  /health                            → {ok, models, gpu}
-  POST /v1/remove  {image_b64|image_url, feather}          → {ok, image_b64, ms}
+  GET  /health                            → {ok, loaded, models, gpu}
+  POST /v1/remove  {image_b64|image_url, feather}            → {ok, image_b64, ms}
   POST /v1/mask    {image_b64|image_url, variant, threshold} → {ok, mask_b64, ms}
   POST /v1/refine  {image_b64|image_url, points:[{x,y,label}]} → {ok, mask_b64, ms}
 
 Engines:
-  - BiRefNet (ZhengPeng7/BiRefNet) in bf16 @1024 — same model as the Modal service,
-    Byron's cleaner bf16 dtype (no fp16 half() workaround needed).
-  - SAM 2.1 (facebook/sam2.1-hiera-large via transformers Sam2Model) — replaces the
+  - BiRefNet (ZhengPeng7/BiRefNet) @1024 — same model as the Modal service. Runs bf16 on
+    Ampere+ GPUs, falls back to fp16 on older cards (pre-Ampere has no bf16), fp32 on CPU.
+  - SAM 2.1 (facebook/sam2.1-hiera-large via transformers Sam2Model), fp32 — replaces the
     Modal service's SAM v1; label 1 = keep (green), 0 = remove (red).
-
-Prints MODEL_SERVER_READY when both models are loaded — worker.py's LogActionConfig
-watches for that line before benchmarking.
 """
 import base64
 import io
 import os
-import sys
+import threading
 import time
+import traceback
 
-import torch
 from fastapi import FastAPI, HTTPException
-from PIL import Image, ImageFilter
+from fastapi.responses import JSONResponse
 
 try:  # iPhone HEIC support (roadmap item — graceful if the wheel is missing)
     from pillow_heif import register_heif_opener
@@ -35,43 +39,85 @@ try:  # iPhone HEIC support (roadmap item — graceful if the wheel is missing)
 except Exception:  # pragma: no cover
     pass
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BG_MODEL = os.environ.get("BG_HF_MODEL", "ZhengPeng7/BiRefNet")
 SAM2_MODEL = os.environ.get("SAM2_MODEL", "facebook/sam2.1-hiera-large")
 SIZE = int(os.environ.get("BG_SIZE", "1024") or 1024)  # BiRefNet is trained at 1024
 MAX_BYTES = int(os.environ.get("BG_MAX_BYTES", str(64 * 1024 * 1024)))
 
-if torch.cuda.is_available():
-    torch.set_float32_matmul_precision("high")
-torch.set_grad_enabled(False)
+# ---------------- lazy model state ----------------
+_lock = threading.Lock()
+_loaded = False
+_load_error = None
+_birefnet = _tf = _sam2 = _sam2_processor = None
+_device = "cpu"
+_dtype = None
 
-print(f"loading BiRefNet ({BG_MODEL}) …", flush=True)
-from torchvision import transforms  # noqa: E402
-from transformers import AutoModelForImageSegmentation, Sam2Model, Sam2Processor  # noqa: E402
 
-_birefnet = (
-    AutoModelForImageSegmentation.from_pretrained(BG_MODEL, trust_remote_code=True, dtype=torch.bfloat16)
-    .to(DEVICE)
-    .eval()
-)
-_tf = transforms.Compose([
-    transforms.Resize((SIZE, SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-])
+def _load_models():
+    """Heavy imports + model downloads. Runs once (background thread at startup;
+    requests block on the lock until it finishes)."""
+    global _loaded, _load_error, _birefnet, _tf, _sam2, _sam2_processor, _device, _dtype
+    if _loaded:
+        return
+    with _lock:
+        if _loaded:
+            return
+        if _load_error:  # don't retry a poisoned load — worker gets recycled instead
+            raise RuntimeError(f"model_load_failed: {_load_error}")
+        try:
+            import torch
+            from torchvision import transforms
+            from transformers import AutoModelForImageSegmentation, Sam2Model, Sam2Processor
 
-print(f"loading SAM 2 ({SAM2_MODEL}) …", flush=True)
-_sam2 = Sam2Model.from_pretrained(SAM2_MODEL).to(DEVICE).eval()
-_sam2_processor = Sam2Processor.from_pretrained(SAM2_MODEL)
+            _device = "cuda" if torch.cuda.is_available() else "cpu"
+            if _device == "cuda":
+                torch.set_float32_matmul_precision("high")
+                # bf16 needs Ampere+ (RTX 3000 onwards); older cards run BiRefNet in fp16
+                # (per its model card), CPU stays fp32.
+                _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            else:
+                _dtype = torch.float32
+            torch.set_grad_enabled(False)
 
-print("MODEL_SERVER_READY", flush=True)
-sys.stdout.flush()
+            print(f"loading BiRefNet ({BG_MODEL}) dtype={_dtype} device={_device} …", flush=True)
+            _birefnet = (
+                AutoModelForImageSegmentation.from_pretrained(BG_MODEL, trust_remote_code=True, dtype=_dtype)
+                .to(_device)
+                .eval()
+            )
+            _tf = transforms.Compose([
+                transforms.Resize((SIZE, SIZE)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
 
-api = FastAPI(title="Sticker it — GPU masking (Vast)", version="1.0.0")
+            print(f"loading SAM 2 ({SAM2_MODEL}) …", flush=True)
+            _sam2 = Sam2Model.from_pretrained(SAM2_MODEL).to(_device).eval()
+            _sam2_processor = Sam2Processor.from_pretrained(SAM2_MODEL)
+
+            _loaded = True
+            print("MODELS_LOADED", flush=True)
+        except Exception as e:  # load failures are fatal for this worker — flag loudly
+            _load_error = str(e)
+            traceback.print_exc()
+            raise
+
+
+api = FastAPI(title="Sticker it — GPU masking (Vast)", version="1.1.0")
+
+
+@api.on_event("startup")
+def _on_startup():
+    # Port is (about to be) open — tell the PyWorker we're ready to accept connections,
+    # then warm the models in the background.
+    print("MODEL_SERVER_READY", flush=True)
+    threading.Thread(target=_load_models, daemon=True).start()
 
 
 # ---------------- helpers ----------------
-def _load_image(payload: dict) -> Image.Image:
+def _load_image(payload: dict):
+    from PIL import Image
+
     b64 = payload.get("image_b64")
     url = payload.get("image_url")
     if b64:
@@ -100,78 +146,113 @@ def _load_image(payload: dict) -> Image.Image:
         raise HTTPException(status_code=400, detail="cannot identify image file")
 
 
-def _png_b64(img: Image.Image) -> str:
+def _png_b64(img) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _birefnet_mask(orig: Image.Image) -> Image.Image:
+def _birefnet_mask(orig):
     """BiRefNet soft mask ('L', 0-255) at the original image size."""
-    x = _tf(orig).unsqueeze(0).to(DEVICE, dtype=torch.bfloat16)
-    out = _birefnet(x)
+    import torch
+    from PIL import Image
+
+    x = _tf(orig).unsqueeze(0).to(_device, dtype=_dtype)
+    with torch.no_grad():
+        out = _birefnet(x)
     pred = out[-1] if isinstance(out, (list, tuple)) else out
     pred = pred.float().sigmoid().cpu()[0].squeeze().numpy()
     return Image.fromarray((pred * 255).astype("uint8"), mode="L").resize(orig.size, Image.LANCZOS)
 
 
+def _guarded(fn):
+    """Run an endpoint body; request-level failures return a 500 JSON WITHOUT printing a
+    traceback (the PyWorker treats 'Traceback' log lines as fatal worker errors — reserve
+    that for model-load crashes, not one bad request)."""
+    try:
+        return fn()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"REQUEST_ERROR: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
 # ---------------- endpoints ----------------
 @api.get("/health")
 def health():
-    return {"ok": True, "birefnet": BG_MODEL, "sam2": SAM2_MODEL, "size": SIZE,
-            "gpu": torch.cuda.is_available(), "engine": "pytorch-bf16"}
+    return {"ok": True, "loaded": _loaded, "load_error": _load_error, "birefnet": BG_MODEL,
+            "sam2": SAM2_MODEL, "size": SIZE, "device": _device, "dtype": str(_dtype)}
 
 
 @api.post("/v1/remove")
 def v1_remove(payload: dict):
-    t0 = time.perf_counter()
-    orig = _load_image(payload)
-    mask = _birefnet_mask(orig)
-    feather = float(payload.get("feather", 1.0) or 0)
-    if feather > 0:
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
-    cut = orig.convert("RGBA")
-    cut.putalpha(mask)
-    return {"ok": True, "image_b64": _png_b64(cut), "ms": round((time.perf_counter() - t0) * 1000)}
+    def run():
+        from PIL import ImageFilter
+
+        t0 = time.perf_counter()
+        _load_models()
+        orig = _load_image(payload)
+        mask = _birefnet_mask(orig)
+        feather = float(payload.get("feather", 1.0) or 0)
+        if feather > 0:
+            mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
+        cut = orig.convert("RGBA")
+        cut.putalpha(mask)
+        return {"ok": True, "image_b64": _png_b64(cut), "ms": round((time.perf_counter() - t0) * 1000)}
+
+    return _guarded(run)
 
 
 @api.post("/v1/mask")
 def v1_mask(payload: dict):
     """Raw BiRefNet mask — for the cutline mask-stage + vectoriser cutout.
     variant: "soft" (default; anti-aliased alpha) or "binary" (solid shape for tracing)."""
-    t0 = time.perf_counter()
-    orig = _load_image(payload)
-    mask = _birefnet_mask(orig)
-    if payload.get("variant", "soft") == "binary":
-        thr = int(payload.get("threshold", 128))
-        mask = mask.point(lambda p: 255 if p >= thr else 0)
-    return {"ok": True, "mask_b64": _png_b64(mask), "width": orig.size[0], "height": orig.size[1],
-            "ms": round((time.perf_counter() - t0) * 1000)}
+    def run():
+        t0 = time.perf_counter()
+        _load_models()
+        orig = _load_image(payload)
+        mask = _birefnet_mask(orig)
+        if payload.get("variant", "soft") == "binary":
+            thr = int(payload.get("threshold", 128))
+            mask = mask.point(lambda p: 255 if p >= thr else 0)
+        return {"ok": True, "mask_b64": _png_b64(mask), "width": orig.size[0], "height": orig.size[1],
+                "ms": round((time.perf_counter() - t0) * 1000)}
+
+    return _guarded(run)
 
 
 @api.post("/v1/refine")
 def v1_refine(payload: dict):
     """SAM 2 point & click: points=[{x,y,label}] in original-image pixels; label 1 = keep
     (green), 0 = remove (red). Returns the best candidate as a binary mask (subject=255)."""
-    t0 = time.perf_counter()
-    pts = payload.get("points")
-    if not isinstance(pts, list) or not pts:
-        raise HTTPException(status_code=400, detail="points must be a non-empty list")
-    orig = _load_image(payload)
+    def run():
+        import torch
+        from PIL import Image
 
-    # transformers SAM 2 shape: [image, object, point, xy] / labels [image, object, point]
-    input_points = [[[[float(p["x"]), float(p["y"])] for p in pts]]]
-    input_labels = [[[int(p.get("label", 1)) for p in pts]]]
-    inputs = _sam2_processor(images=orig, input_points=input_points, input_labels=input_labels,
-                             return_tensors="pt").to(DEVICE)
-    outputs = _sam2(**inputs)
-    masks = _sam2_processor.post_process_masks(outputs.pred_masks.cpu(), inputs["original_sizes"])[0]
-    scores = outputs.iou_scores.cpu()[0][0]           # [num_masks]
-    best = int(scores.argmax())
-    m = masks[0][best].numpy().astype("uint8") * 255  # [num_masks, H, W] → best
-    mask = Image.fromarray(m, mode="L")
-    return {"ok": True, "mask_b64": _png_b64(mask), "score": float(scores[best]),
-            "ms": round((time.perf_counter() - t0) * 1000)}
+        t0 = time.perf_counter()
+        pts = payload.get("points")
+        if not isinstance(pts, list) or not pts:
+            raise HTTPException(status_code=400, detail="points must be a non-empty list")
+        _load_models()
+        orig = _load_image(payload)
+
+        # transformers SAM 2 shape: [image, object, point, xy] / labels [image, object, point]
+        input_points = [[[[float(p["x"]), float(p["y"])] for p in pts]]]
+        input_labels = [[[int(p.get("label", 1)) for p in pts]]]
+        inputs = _sam2_processor(images=orig, input_points=input_points, input_labels=input_labels,
+                                 return_tensors="pt").to(_device)
+        with torch.no_grad():
+            outputs = _sam2(**inputs)
+        masks = _sam2_processor.post_process_masks(outputs.pred_masks.cpu(), inputs["original_sizes"])[0]
+        scores = outputs.iou_scores.cpu()[0][0]           # [num_masks]
+        best = int(scores.argmax())
+        m = masks[0][best].numpy().astype("uint8") * 255  # [num_masks, H, W] → best
+        mask = Image.fromarray(m, mode="L")
+        return {"ok": True, "mask_b64": _png_b64(mask), "score": float(scores[best]),
+                "ms": round((time.perf_counter() - t0) * 1000)}
+
+    return _guarded(run)
 
 
 if __name__ == "__main__":

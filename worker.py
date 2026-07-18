@@ -28,10 +28,12 @@ MODEL_LOG_FILE = os.environ.get("MODEL_LOG_FILE", "/var/log/model/server.log")
 
 # ---------------- start the model server ----------------
 os.makedirs(os.path.dirname(MODEL_LOG_FILE), exist_ok=True)
-_log = open(MODEL_LOG_FILE, "w")  # fresh log per worker start (PyWorker tails current run)
+open(MODEL_LOG_FILE, "w").close()  # fresh log per worker start (PyWorker tails current run)
+_server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
+# tee: the PyWorker tails MODEL_LOG_FILE for readiness, AND the output reaches stdout so it
+# shows up in the Vast instance-log viewer (debugging without this was painful).
 subprocess.Popen(
-    [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")],
-    stdout=_log, stderr=subprocess.STDOUT,
+    ["bash", "-c", f'exec "{sys.executable}" -u "{_server_path}" 2>&1 | tee -a "{MODEL_LOG_FILE}"'],
     env={**os.environ, "MODEL_SERVER_PORT": str(MODEL_SERVER_PORT)},
 )
 
