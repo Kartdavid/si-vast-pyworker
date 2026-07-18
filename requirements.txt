@@ -1,0 +1,16 @@
+# Vast serverless PyWorker + model server deps (installed by the template start script)
+vastai
+torch
+torchvision
+transformers>=4.56
+timm
+einops
+kornia
+pillow
+pillow-heif
+numpy
+scipy
+opencv-python-headless
+fastapi
+uvicorn
+requests
