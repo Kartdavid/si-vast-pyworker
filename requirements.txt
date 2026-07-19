@@ -2,7 +2,9 @@
 vastai
 torch
 torchvision
-transformers>=4.56
+# Pinned <5: BiRefNet's remote code + our Sam2 usage were written against the 4.x series;
+# transformers 5.x (released mid-2026) broke model loading on the workers.
+transformers>=4.56,<5
 timm
 einops
 kornia
