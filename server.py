@@ -43,6 +43,10 @@ BG_MODEL = os.environ.get("BG_HF_MODEL", "ZhengPeng7/BiRefNet")
 SAM2_MODEL = os.environ.get("SAM2_MODEL", "facebook/sam2.1-hiera-large")
 SIZE = int(os.environ.get("BG_SIZE", "1024") or 1024)  # BiRefNet is trained at 1024
 MAX_BYTES = int(os.environ.get("BG_MAX_BYTES", str(64 * 1024 * 1024)))
+# Optional API key (RunPod / any direct-exposure deployment). If set, /v1/* requests must
+# send it as the X-Api-Key header. On Vast this stays unset — the PyWorker's signature
+# system is the gatekeeper there.
+API_KEY = os.environ.get("API_KEY", "")
 
 # ---------------- lazy model state ----------------
 _lock = threading.Lock()
@@ -108,7 +112,15 @@ def _load_models():
             raise
 
 
-api = FastAPI(title="Sticker it — GPU masking (Vast)", version="1.1.0")
+api = FastAPI(title="Sticker it — GPU masking", version="1.2.0")
+
+
+@api.middleware("http")
+async def _auth(request, call_next):
+    if API_KEY and request.url.path.startswith("/v1/"):
+        if request.headers.get("x-api-key") != API_KEY:
+            return JSONResponse(status_code=401, content={"ok": False, "error": "invalid_api_key"})
+    return await call_next(request)
 
 
 @api.on_event("startup")
@@ -263,5 +275,7 @@ def v1_refine(payload: dict):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(api, host="127.0.0.1", port=int(os.environ.get("MODEL_SERVER_PORT", "18000")),
-                log_level="warning")
+    # 0.0.0.0 so a directly-exposed deployment (RunPod pod) is reachable; on Vast the port
+    # isn't published, so this is equally safe behind the PyWorker.
+    uvicorn.run(api, host=os.environ.get("MODEL_SERVER_HOST", "0.0.0.0"),
+                port=int(os.environ.get("MODEL_SERVER_PORT", "18000")), log_level="warning")

@@ -47,3 +47,8 @@ print('models load OK')"
 # ---- Bake the worker code as a git clone; the template's on-start does a `git pull` ----
 # ---- so small code fixes ship without rebuilding the image.                          ----
 RUN git clone https://github.com/Kartdavid/si-vast-pyworker /workspace/vast-pyworker
+
+# Default command = run the model server directly. This is what a RunPod pod (or any
+# plain Docker host) uses: the API is served on port 18000, protected by the API_KEY env.
+# Vast ignores this (its wrapper's entrypoint + on-start drive the PyWorker instead).
+CMD ["python", "/workspace/vast-pyworker/server.py"]

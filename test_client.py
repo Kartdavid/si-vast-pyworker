@@ -21,16 +21,31 @@ ENDPOINT_NAME = os.environ.get("VAST_ENDPOINT", "si-gpu-masking-staging")
 ROUTE_URL = "https://run.vast.ai/route/"
 
 
-def _api_key() -> str:
-    if os.environ.get("VAST_API_KEY"):
-        return os.environ["VAST_API_KEY"]
+def _env_file(name: str) -> str | None:
+    """Read KEY=value lines from .env.vast (next to this script or cwd) + real env vars."""
+    if os.environ.get(name):
+        return os.environ[name]
     here = os.path.dirname(os.path.abspath(__file__))
-    for p in (os.path.join(here, "..", ".env.vast"), ".env.vast"):
+    for p in (os.path.join(here, ".env.vast"), os.path.join(here, "..", ".env.vast"), ".env.vast"):
         if os.path.exists(p):
             for line in open(p):
-                if line.strip().startswith("VAST_API_KEY="):
+                if line.strip().startswith(f"{name}="):
                     return line.strip().split("=", 1)[1]
-    sys.exit("VAST_API_KEY not found (env var or apps/bg-remove/.env.vast)")
+    return None
+
+
+# Direct mode (RunPod pod or any plain host): set GPU_MASK_URL (+ GPU_MASK_KEY) in
+# .env.vast and the client POSTs straight to {url}/v1/... with the X-Api-Key header —
+# no Vast routing involved.
+DIRECT_URL = _env_file("GPU_MASK_URL")
+DIRECT_KEY = _env_file("GPU_MASK_KEY")
+
+
+def _api_key() -> str:
+    key = _env_file("VAST_API_KEY")
+    if key:
+        return key
+    sys.exit("VAST_API_KEY not found (env var or .env.vast)")
 
 
 def _post_json(url: str, body: dict, headers: dict | None = None, timeout: int = 180) -> dict:
@@ -54,6 +69,14 @@ def _endpoint_key(account_key: str) -> str:
 
 
 def call(route: str, payload: dict) -> dict:
+    if DIRECT_URL:  # RunPod / plain host: straight POST, X-Api-Key auth
+        t0 = time.perf_counter()
+        headers = {"X-Api-Key": DIRECT_KEY} if DIRECT_KEY else {}
+        out = _post_json(DIRECT_URL.rstrip("/") + route, payload, headers)
+        print(f"direct {DIRECT_URL} answered in {round((time.perf_counter() - t0) * 1000)}ms "
+              f"(server ms: {out.get('ms', '?')})")
+        return out
+
     key = _endpoint_key(_api_key())
     t0 = time.perf_counter()
     auth = _post_json(ROUTE_URL, {"endpoint": ENDPOINT_NAME, "cost": 100},
