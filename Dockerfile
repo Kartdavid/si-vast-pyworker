@@ -1,0 +1,49 @@
+# Sticker it — GPU masking worker image for Vast.ai serverless.
+#
+# EVERYTHING is baked in: Python deps (pinned), BiRefNet + SAM 2.1 model weights, and the
+# worker code. A fresh Vast machine only pulls this image and runs — no pip installs, no
+# HuggingFace downloads, no version drift. Boot-to-Ready becomes ~3 minutes, identical on
+# every host.
+#
+# Built + published by .github/workflows/build-image.yml → ghcr.io/kartdavid/si-gpu-masking
+#
+# Notes:
+# - python:3.10-slim base, no CUDA toolkit needed: torch pip wheels bundle their own CUDA
+#   (the same trick the Modal deployment used — "it just works" on any NVIDIA host driver).
+# - Vast wraps every image on the host with its own ssh/tmux layer (apt-based), so a slim
+#   Debian base is fine.
+# - The template must set USE_SYSTEM_PYTHON=true so Vast's start_server.sh uses this
+#   image's Python directly instead of building a venv.
+
+FROM python:3.10-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/models
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git curl ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Python deps (the pinned requirements are the source of truth) ----
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ---- Bake the models into the HF cache (BiRefNet ~1 GB + SAM 2.1 large ~1 GB) ----
+RUN python -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('ZhengPeng7/BiRefNet', ignore_patterns=['*.onnx', '*.bin']); \
+snapshot_download('facebook/sam2.1-hiera-large', ignore_patterns=['*.pt'])"
+
+# ---- Build-time sanity gate: actually LOAD both models on CPU. If a dependency bump ----
+# ---- ever breaks model loading again, the BUILD fails — not the GPU fleet.          ----
+RUN python -c "\
+from transformers import AutoModelForImageSegmentation, Sam2Model, Sam2Processor; \
+m = AutoModelForImageSegmentation.from_pretrained('ZhengPeng7/BiRefNet', trust_remote_code=True); \
+s = Sam2Model.from_pretrained('facebook/sam2.1-hiera-large'); \
+p = Sam2Processor.from_pretrained('facebook/sam2.1-hiera-large'); \
+print('models load OK')"
+
+# ---- Bake the worker code as a git clone; the template's on-start does a `git pull` ----
+# ---- so small code fixes ship without rebuilding the image.                          ----
+RUN git clone https://github.com/Kartdavid/si-vast-pyworker /workspace/vast-pyworker
