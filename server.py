@@ -205,6 +205,9 @@ def health():
 
 @api.post("/v1/remove")
 def v1_remove(payload: dict):
+    """Optional `result_put_url` (presigned PUT): the pod uploads the PNG straight to
+    storage and returns tiny JSON instead of megabytes of base64 — the platform worker
+    uses this so image bytes never round-trip through it."""
     def run():
         from PIL import ImageFilter
 
@@ -217,6 +220,17 @@ def v1_remove(payload: dict):
             mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
         cut = orig.convert("RGBA")
         cut.putalpha(mask)
+        put_url = payload.get("result_put_url")
+        if put_url:
+            import requests
+
+            buf = io.BytesIO()
+            cut.save(buf, format="PNG")
+            r = requests.put(put_url, data=buf.getvalue(),
+                             headers={"Content-Type": "image/png"}, timeout=60)
+            if not r.ok:
+                raise RuntimeError(f"result_upload_failed: {r.status_code}")
+            return {"ok": True, "stored": True, "ms": round((time.perf_counter() - t0) * 1000)}
         return {"ok": True, "image_b64": _png_b64(cut), "ms": round((time.perf_counter() - t0) * 1000)}
 
     return _guarded(run)
