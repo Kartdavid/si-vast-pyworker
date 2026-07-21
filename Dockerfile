@@ -19,13 +19,22 @@ FROM python:3.10-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/models
+    HF_HOME=/models \
+    # Tell NVIDIA's container runtime to inject the GPU driver (CUDA-base images set
+    # these; a slim Python base must ask explicitly or torch sees no GPU)
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git curl ca-certificates libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- Python deps (the pinned requirements are the source of truth) ----
+# torch first, pinned to the CUDA 12.4 build: it runs on ANY host driver >= 12.4 (the
+# default PyPI torch ships CUDA 13 and silently falls back to CPU on older drivers —
+# which is most of the GPU-cloud fleet). 2.6.0 is a stable, well-tested pairing.
+RUN pip install --no-cache-dir torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu124
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 

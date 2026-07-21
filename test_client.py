@@ -50,7 +50,11 @@ def _api_key() -> str:
 
 def _post_json(url: str, body: dict, headers: dict | None = None, timeout: int = 180) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json", **(headers or {})})
+                                 headers={"Content-Type": "application/json",
+                                          # some proxies (RunPod/Cloudflare) 403 the default
+                                          # "Python-urllib" identity — send a normal one
+                                          "User-Agent": "si-gpu-masking-client/1.0",
+                                          **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
