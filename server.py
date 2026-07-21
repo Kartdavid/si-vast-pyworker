@@ -283,8 +283,20 @@ def v1_refine(payload: dict):
             outputs = _sam2(**inputs)
         masks = _sam2_processor.post_process_masks(outputs.pred_masks.cpu(), inputs["original_sizes"])[0]
         scores = outputs.iou_scores.cpu()[0][0]           # [num_masks]
+        cand = masks[0].numpy().astype("uint8")           # [num_masks, H, W]
+        # SAM 2 returns candidates at ~3 granularities (sub-part / part / whole). Raw
+        # argmax-by-score loves the tiniest coherent thing under the click (a single
+        # letter in a word). For touch-up UX, if the top-scoring mask is tiny and a
+        # near-as-confident candidate is much larger, prefer the larger region.
+        total = cand.shape[1] * cand.shape[2]
+        areas = [int(c.sum()) for c in cand]
         best = int(scores.argmax())
-        m = masks[0][best].numpy().astype("uint8") * 255  # [num_masks, H, W] → best
+        if areas[best] < 0.02 * total:
+            for i in range(len(areas)):
+                if i != best and float(scores[i]) >= float(scores[best]) - 0.15 and areas[i] >= 3 * areas[best]:
+                    if areas[i] > areas[best]:
+                        best = i
+        m = cand[best] * 255
         mask = Image.fromarray(m, mode="L")
         return {"ok": True, "mask_b64": _png_b64(mask), "score": float(scores[best]),
                 "ms": round((time.perf_counter() - t0) * 1000)}
