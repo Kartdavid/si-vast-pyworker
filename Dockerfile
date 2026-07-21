@@ -30,11 +30,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- Python deps (the pinned requirements are the source of truth) ----
-# torch first, pinned to the CUDA 12.4 build: it runs on ANY host driver >= 12.4 (the
-# default PyPI torch ships CUDA 13 and silently falls back to CPU on older drivers —
-# which is most of the GPU-cloud fleet). 2.6.0 is a stable, well-tested pairing.
-RUN pip install --no-cache-dir torch==2.6.0 torchvision==0.21.0 \
-    --index-url https://download.pytorch.org/whl/cu124
+# torch first, pinned to 2.6.0: its standard PyPI wheel bundles CUDA 12.4, which runs on
+# ANY host driver >= 12.4. (Latest torch bundles CUDA 13 and silently falls back to CPU
+# on the older drivers most GPU-cloud hosts still run — that cost us a day.)
+# NB: installed from plain PyPI on purpose — pip rejects download.pytorch.org's index
+# over a typing-extensions metadata-name quirk.
+RUN pip install --no-cache-dir torch==2.6.0 torchvision==0.21.0
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
