@@ -290,12 +290,22 @@ def v1_refine(payload: dict):
         # near-as-confident candidate is much larger, prefer the larger region.
         total = cand.shape[1] * cand.shape[2]
         areas = [int(c.sum()) for c in cand]
-        best = int(scores.argmax())
-        if areas[best] < 0.02 * total:
-            for i in range(len(areas)):
-                if i != best and float(scores[i]) >= float(scores[best]) - 0.15 and areas[i] >= 3 * areas[best]:
-                    if areas[i] > areas[best]:
-                        best = i
+        # Candidate policy for touch-up clicks (learned from live testing 21 Jul):
+        #  - a click on a letter shouldn't select one glyph  → promote larger candidates
+        #  - a click on the background shouldn't select the WHOLE design and wipe it
+        #    → hard ceiling at 40% of the canvas; if every candidate is huge, take the
+        #      smallest one instead (the user can click again — never nuke everything).
+        MAX_SHARE = 0.40
+        ok = [i for i in range(len(areas)) if areas[i] <= MAX_SHARE * total]
+        if not ok:
+            best = int(min(range(len(areas)), key=lambda i: areas[i]))
+        else:
+            best = max(ok, key=lambda i: float(scores[i]))
+            if areas[best] < 0.02 * total:
+                for i in ok:
+                    if i != best and float(scores[i]) >= float(scores[best]) - 0.15 and areas[i] >= 3 * areas[best]:
+                        if areas[i] > areas[best]:
+                            best = i
         m = cand[best] * 255
         mask = Image.fromarray(m, mode="L")
         return {"ok": True, "mask_b64": _png_b64(mask), "score": float(scores[best]),
