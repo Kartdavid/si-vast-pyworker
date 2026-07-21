@@ -55,8 +55,12 @@ def _post_json(url: str, body: dict, headers: dict | None = None, timeout: int =
                                           # "Python-urllib" identity — send a normal one
                                           "User-Agent": "si-gpu-masking-client/1.0",
                                           **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:  # show the server's error body, not just the code
+        detail = e.read().decode(errors="replace")[:500]
+        sys.exit(f"HTTP {e.code} from {url}\nserver said: {detail}")
 
 
 def _endpoint_key(account_key: str) -> str:

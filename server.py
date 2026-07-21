@@ -76,9 +76,10 @@ def _load_models():
             _device = "cuda" if torch.cuda.is_available() else "cpu"
             if _device == "cuda":
                 torch.set_float32_matmul_precision("high")
-                # bf16 needs Ampere+ (RTX 3000 onwards); older cards run BiRefNet in fp16
-                # (per its model card), CPU stays fp32.
-                _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                # fp16, NOT bf16: BiRefNet's deformable-conv op has no BFloat16 kernel
+                # ("deformable_im2col not implemented for 'BFloat16'"). fp16 is the model
+                # card's recommended mode and ran the Modal deployment in production.
+                _dtype = torch.float16
             else:
                 _dtype = torch.float32
             torch.set_grad_enabled(False)
