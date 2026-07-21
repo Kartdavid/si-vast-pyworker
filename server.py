@@ -180,7 +180,9 @@ def _birefnet_mask(orig):
         out = _birefnet(x)
     pred = out[-1] if isinstance(out, (list, tuple)) else out
     pred = pred.float().sigmoid().cpu()[0].squeeze().numpy()
-    return Image.fromarray((pred * 255).astype("uint8"), mode="L").resize(orig.size, Image.LANCZOS)
+    # BILINEAR, not LANCZOS: upscaling a soft 1024px alpha mask to full res — visually
+    # identical after feathering, and several times faster on big originals.
+    return Image.fromarray((pred * 255).astype("uint8"), mode="L").resize(orig.size, Image.BILINEAR)
 
 
 def _guarded(fn):
@@ -225,7 +227,10 @@ def v1_remove(payload: dict):
             import requests
 
             buf = io.BytesIO()
-            cut.save(buf, format="PNG")
+            # compress_level=1: PNG encoding of a full-res RGBA cutout at PIL's default
+            # level was the single biggest cost on large images (~seconds). Level 1 is
+            # 3-5x faster; the file is bigger but it's a transient working artifact.
+            cut.save(buf, format="PNG", compress_level=1)
             r = requests.put(put_url, data=buf.getvalue(),
                              headers={"Content-Type": "image/png"}, timeout=60)
             if not r.ok:
