@@ -68,7 +68,25 @@ def soft_iou_loss(logits, target):
 
 
 def out_list(out):
-    return list(out) if isinstance(out, (list, tuple)) else [out]
+    """BiRefNet's training forward returns NESTED lists/tuples (multi-scale side outputs
+    + aux heads). Flatten recursively; keep only 4-D mask logits (aux class heads are 2-D)."""
+    res = []
+    def walk(o):
+        if torch.is_tensor(o):
+            if o.dim() == 4 and o.shape[1] == 1:
+                res.append(o)
+        elif isinstance(o, (list, tuple)):
+            for x in o:
+                walk(x)
+    walk(out)
+    return res
+
+
+def match(o, y):
+    """Resize target to a side output's scale when they differ (multi-scale supervision)."""
+    if o.shape[-2:] == y.shape[-2:]:
+        return y
+    return F.interpolate(y, size=o.shape[-2:], mode="bilinear", align_corners=False)
 
 
 @torch.no_grad()
@@ -111,8 +129,10 @@ def main():
             x, y = x.to(DEV, non_blocking=True), y.to(DEV, non_blocking=True)
             with torch.autocast(DEV, dtype=torch.float16):
                 outs = out_list(model(x))
-                loss = sum(F.binary_cross_entropy_with_logits(o.float(), y) for o in outs) / len(outs)
-                loss = loss + soft_iou_loss(outs[-1].float(), y)
+                if not outs:
+                    raise RuntimeError("no mask logits found in model output")
+                loss = sum(F.binary_cross_entropy_with_logits(o.float(), match(o, y)) for o in outs) / len(outs)
+                loss = loss + soft_iou_loss(outs[-1].float(), match(outs[-1], y))
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt)
