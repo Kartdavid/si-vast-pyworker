@@ -1,18 +1,8 @@
 #!/bin/bash
-# Pod entrypoint: SSH support (RunPod injects the account's key as $PUBLIC_KEY) + the
-# usual code-refresh + model server. Works on RunPod pods and any plain Docker host.
-
-# --- sshd (only if a public key was provided and sshd exists) ---
-if [ -n "$PUBLIC_KEY" ] && command -v sshd >/dev/null 2>&1; then
-  mkdir -p /root/.ssh /run/sshd
-  echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
-  chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
-  /usr/sbin/sshd -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no
-  echo "sshd up (key auth)"
-fi
-
-# --- freshen worker code (code fixes ship with a pod restart, no rebuild) ---
+# Baked bootstrap (image layer): freshen the repo, then hand over to the REPO's boot
+# script — so all future boot-logic changes ship with a pod restart, never a rebuild.
 cd /workspace/vast-pyworker && (git pull --ff-only || true)
-
-# --- model server (API on 18000, guarded by API_KEY env) ---
+if [ -f /workspace/vast-pyworker/start-pod.sh ]; then
+  exec bash /workspace/vast-pyworker/start-pod.sh
+fi
 exec python3 /workspace/vast-pyworker/server.py
