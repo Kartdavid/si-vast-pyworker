@@ -27,6 +27,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git curl ca-certificates libgl1 libglib2.0-0 \
+       openssh-server unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- Python deps (the pinned requirements are the source of truth) ----
@@ -58,8 +59,9 @@ print('models load OK')"
 # ---- so small code fixes ship without rebuilding the image.                          ----
 RUN git clone https://github.com/Kartdavid/si-vast-pyworker /workspace/vast-pyworker
 
-# Default command = freshen the code (so pure code fixes ship with a pod RESTART, no
-# image rebuild), then run the model server: API on port 18000, protected by API_KEY.
-# Offline-safe: if the pull fails, the baked copy runs. Vast ignores this CMD (its
-# wrapper's entrypoint + on-start drive the PyWorker instead).
-CMD ["bash", "-c", "cd /workspace/vast-pyworker && (git pull --ff-only || true) && exec python server.py"]
+# Default command = start.sh: sets up SSH when RunPod provides $PUBLIC_KEY (web terminal
+# doesn't work on slim custom images — SSH is the reliable console), freshens the worker
+# code (code fixes ship with a pod RESTART, no rebuild), then runs the model server.
+# Vast ignores this CMD (its wrapper's entrypoint + on-start drive the PyWorker instead).
+COPY start.sh /start.sh
+CMD ["bash", "/start.sh"]
