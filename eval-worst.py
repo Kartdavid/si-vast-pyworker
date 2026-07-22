@@ -22,7 +22,15 @@ DEV = "cuda"
 os.makedirs(OUT, exist_ok=True)
 norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-model = AutoModelForImageSegmentation.from_pretrained(WEIGHTS, trust_remote_code=True).to(DEV).eval()
+# Local save of a custom-code model loses its model_type — so build the ARCHITECTURE
+# from the hub and load OUR fine-tuned weights into it (production loads them the same way).
+from safetensors.torch import load_file
+
+model = AutoModelForImageSegmentation.from_pretrained("ZhengPeng7/BiRefNet", trust_remote_code=True)
+sd = load_file(os.path.join(WEIGHTS, "model.safetensors"))
+missing, unexpected = model.load_state_dict(sd, strict=False)
+print(f"loaded fine-tuned weights: {len(sd)} tensors ({len(missing)} missing, {len(unexpected)} unexpected)")
+model = model.to(DEV).eval()
 torch.set_grad_enabled(False)
 
 rows = []
