@@ -43,6 +43,16 @@ BG_MODEL = os.environ.get("BG_HF_MODEL", "ZhengPeng7/BiRefNet")
 SAM2_MODEL = os.environ.get("SAM2_MODEL", "facebook/sam2.1-hiera-large")
 SIZE = int(os.environ.get("BG_SIZE", "1024") or 1024)  # BiRefNet is trained at 1024
 MAX_BYTES = int(os.environ.get("BG_MAX_BYTES", str(64 * 1024 * 1024)))
+# Optional fine-tuned BiRefNet (our cutline-trained weights). If the safetensors file at
+# FT_WEIGHTS_PATH exists at startup, it's loaded as a SECOND model (the stock hub model
+# stays loaded too) and callers can select it per-request with {"model": FT_MODEL_NAME}.
+# The architecture is built from the same hub id as stock; only the weights differ — the
+# proven load_state_dict(strict=False) pattern from eval-worst.py. If the file is missing,
+# nothing changes: only the stock model exists and every request serves it exactly as before.
+# Default under /workspace: that's the persistent location the git-pulled code already lives
+# in, so weights placed there survive the normal restart-and-git-pull cycle just like the code.
+FT_MODEL_NAME = os.environ.get("FT_MODEL_NAME", "cutline-v1")
+FT_WEIGHTS_PATH = os.environ.get("FT_WEIGHTS_PATH", "/workspace/cutline-v1/model.safetensors")
 # Optional API key (RunPod / any direct-exposure deployment). If set, /v1/* requests must
 # send it as the X-Api-Key header. On Vast this stays unset — the PyWorker's signature
 # system is the gatekeeper there.
@@ -52,7 +62,8 @@ API_KEY = os.environ.get("API_KEY", "")
 _lock = threading.Lock()
 _loaded = False
 _load_error = None
-_birefnet = _tf = _sam2 = _sam2_processor = None
+_birefnet = _birefnet_ft = _tf = _sam2 = _sam2_processor = None
+_ft_error = None  # non-fatal: fine-tune load failed but stock is fine → serve stock
 _device = "cpu"
 _dtype = None
 
@@ -60,7 +71,7 @@ _dtype = None
 def _load_models():
     """Heavy imports + model downloads. Runs once (background thread at startup;
     requests block on the lock until it finishes)."""
-    global _loaded, _load_error, _birefnet, _tf, _sam2, _sam2_processor, _device, _dtype
+    global _loaded, _load_error, _birefnet, _birefnet_ft, _ft_error, _tf, _sam2, _sam2_processor, _device, _dtype
     if _loaded:
         return
     with _lock:
@@ -96,6 +107,27 @@ def _load_models():
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ])
 
+            # Optional fine-tune: build the SAME architecture from the hub, then load OUR
+            # weights into it. Failure here is NON-fatal — we log it and keep serving stock,
+            # so a bad/partial weights file can never take the whole worker down.
+            if os.path.exists(FT_WEIGHTS_PATH):
+                try:
+                    from safetensors.torch import load_file
+
+                    print(f"loading fine-tune '{FT_MODEL_NAME}' from {FT_WEIGHTS_PATH} …", flush=True)
+                    ft = AutoModelForImageSegmentation.from_pretrained(BG_MODEL, trust_remote_code=True, dtype=_dtype)
+                    sd = load_file(FT_WEIGHTS_PATH)
+                    missing, unexpected = ft.load_state_dict(sd, strict=False)
+                    _birefnet_ft = ft.to(_device).eval()
+                    print(f"FINE_TUNE_LOADED name={FT_MODEL_NAME} tensors={len(sd)} "
+                          f"missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+                except Exception as fe:  # non-fatal
+                    _ft_error = str(fe)
+                    _birefnet_ft = None
+                    print(f"FINE_TUNE_LOAD_FAILED: {fe} — serving stock only", flush=True)
+            else:
+                print(f"no fine-tune at {FT_WEIGHTS_PATH} — stock only", flush=True)
+
             print(f"loading SAM 2 ({SAM2_MODEL}) …", flush=True)
             _sam2 = Sam2Model.from_pretrained(SAM2_MODEL).to(_device).eval()
             _sam2_processor = Sam2Processor.from_pretrained(SAM2_MODEL)
@@ -113,7 +145,7 @@ def _load_models():
             raise
 
 
-api = FastAPI(title="Sticker it — GPU masking", version="1.2.0")
+api = FastAPI(title="Sticker it — GPU masking", version="1.3.0")
 
 
 @api.middleware("http")
@@ -170,14 +202,26 @@ def _png_b64(img) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _birefnet_mask(orig):
-    """BiRefNet soft mask ('L', 0-255) at the original image size."""
+def _resolve_model(name):
+    """Map a request's `model` param to a loaded net. Anything falsy or "stock" → stock.
+    The fine-tune name → fine-tune IF it loaded, else transparently fall back to stock
+    (a request must never fail just because the fine-tune is unavailable). Returns
+    (net, served_name) so callers can report which model actually ran."""
+    if name and name == FT_MODEL_NAME and _birefnet_ft is not None:
+        return _birefnet_ft, FT_MODEL_NAME
+    return _birefnet, "stock"
+
+
+def _birefnet_mask(orig, net=None):
+    """BiRefNet soft mask ('L', 0-255) at the original image size. `net` selects which
+    loaded model to run (defaults to stock)."""
     import torch
     from PIL import Image
 
+    net = net or _birefnet
     x = _tf(orig).unsqueeze(0).to(_device, dtype=_dtype)
     with torch.no_grad():
-        out = _birefnet(x)
+        out = net(x)
     pred = out[-1] if isinstance(out, (list, tuple)) else out
     pred = pred.float().sigmoid().cpu()[0].squeeze().numpy()
     # BILINEAR, not LANCZOS: upscaling a soft 1024px alpha mask to full res — visually
@@ -202,7 +246,9 @@ def _guarded(fn):
 @api.get("/health")
 def health():
     return {"ok": True, "loaded": _loaded, "load_error": _load_error, "birefnet": BG_MODEL,
-            "sam2": SAM2_MODEL, "size": SIZE, "device": _device, "dtype": str(_dtype)}
+            "sam2": SAM2_MODEL, "size": SIZE, "device": _device, "dtype": str(_dtype),
+            # fine-tune visibility: ft_loaded True means callers can request it by name.
+            "ft_model": FT_MODEL_NAME, "ft_loaded": _birefnet_ft is not None, "ft_error": _ft_error}
 
 
 @api.post("/v1/remove")
@@ -216,7 +262,8 @@ def v1_remove(payload: dict):
         t0 = time.perf_counter()
         _load_models()
         orig = _load_image(payload)
-        mask = _birefnet_mask(orig)
+        net, served = _resolve_model(payload.get("model"))
+        mask = _birefnet_mask(orig, net)
         feather = float(payload.get("feather", 1.0) or 0)
         if feather > 0:
             mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
@@ -235,8 +282,9 @@ def v1_remove(payload: dict):
                              headers={"Content-Type": "image/png"}, timeout=60)
             if not r.ok:
                 raise RuntimeError(f"result_upload_failed: {r.status_code}")
-            return {"ok": True, "stored": True, "ms": round((time.perf_counter() - t0) * 1000)}
-        return {"ok": True, "image_b64": _png_b64(cut), "ms": round((time.perf_counter() - t0) * 1000)}
+            return {"ok": True, "stored": True, "model": served, "ms": round((time.perf_counter() - t0) * 1000)}
+        return {"ok": True, "image_b64": _png_b64(cut), "model": served,
+                "ms": round((time.perf_counter() - t0) * 1000)}
 
     return _guarded(run)
 
@@ -249,12 +297,13 @@ def v1_mask(payload: dict):
         t0 = time.perf_counter()
         _load_models()
         orig = _load_image(payload)
-        mask = _birefnet_mask(orig)
+        net, served = _resolve_model(payload.get("model"))
+        mask = _birefnet_mask(orig, net)
         if payload.get("variant", "soft") == "binary":
             thr = int(payload.get("threshold", 128))
             mask = mask.point(lambda p: 255 if p >= thr else 0)
         return {"ok": True, "mask_b64": _png_b64(mask), "width": orig.size[0], "height": orig.size[1],
-                "ms": round((time.perf_counter() - t0) * 1000)}
+                "model": served, "ms": round((time.perf_counter() - t0) * 1000)}
 
     return _guarded(run)
 
